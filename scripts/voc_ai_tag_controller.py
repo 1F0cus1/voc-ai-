@@ -471,6 +471,173 @@ def load_labels(conn, label_version: str) -> tuple[list[Label], bool]:
     return labels, False
 
 
+def source_rows_for_warehouse_sync(
+    source_conn,
+    source_table: str,
+    result_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    source_keys = list(
+        dict.fromkeys(normalize_hash_value(row.get("source_key")) for row in result_rows)
+    )
+    platform_order_nos = list(
+        dict.fromkeys(normalize_hash_value(row.get("platform_order_no")) for row in result_rows)
+    )
+    sub_order_nos = list(
+        dict.fromkeys(normalize_hash_value(row.get("sub_order_no")) for row in result_rows)
+    )
+    register_times = list(
+        dict.fromkeys(row.get("register_time") for row in result_rows if row.get("register_time"))
+    )
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    for column, values in [
+        ("w.voc_hash", [value for value in source_keys if value]),
+        ("w.platform_order_no", [value for value in platform_order_nos if value]),
+        ("w.sub_order_no", [value for value in sub_order_nos if value]),
+        ("w.register_time", register_times),
+    ]:
+        if values:
+            clauses.append(f"{column} IN ({', '.join(['%s'] * len(values))})")
+            params.extend(values)
+
+    if not clauses:
+        return []
+
+    sql = f"""
+        SELECT
+          w.voc_hash,
+          w.data_source,
+          w.channel,
+          w.platform_order_no,
+          w.sub_order_no,
+          w.register_time,
+          w.raw_feedback,
+          w.warehouse_name
+        FROM {source_table} w
+        WHERE w.warehouse_name IS NOT NULL
+          AND TRIM(w.warehouse_name) <> ''
+          AND ({' OR '.join(clauses)})
+    """
+    with source_conn.cursor() as cur:
+        cur.execute(sql, params)
+        return list(cur.fetchall())
+
+
+def warehouse_source_lookup(
+    source_rows: list[dict[str, Any]],
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[tuple[str, tuple[str, ...]], dict[str, Any]],
+]:
+    by_source_key: dict[str, dict[str, Any]] = {}
+    by_business_hash: dict[str, dict[str, Any]] = {}
+    by_text_identity: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
+    for row in source_rows:
+        source_key = source_key_value(row)
+        if source_key:
+            by_source_key.setdefault(source_key, row)
+        by_business_hash.setdefault(business_input_hash(row), row)
+        by_text_identity.setdefault((text_input_hash(row), business_identity(row)), row)
+    return by_source_key, by_business_hash, by_text_identity
+
+
+def matching_warehouse_source(
+    result_row: dict[str, Any],
+    lookup: tuple[
+        dict[str, dict[str, Any]],
+        dict[str, dict[str, Any]],
+        dict[tuple[str, tuple[str, ...]], dict[str, Any]],
+    ],
+) -> dict[str, Any] | None:
+    by_source_key, by_business_hash, by_text_identity = lookup
+    source_key = normalize_hash_value(result_row.get("source_key"))
+    if source_key and source_key in by_source_key:
+        return by_source_key[source_key]
+
+    input_hash = normalize_hash_value(result_row.get("input_hash"))
+    if input_hash and input_hash in by_business_hash:
+        return by_business_hash[input_hash]
+    if input_hash:
+        return by_text_identity.get((input_hash, business_identity(result_row)))
+    return None
+
+
+def sync_missing_warehouse_names(
+    source_conn,
+    target_conn,
+    source_table: str,
+    log,
+    dry_run: bool,
+    should_stop,
+    batch_size: int = 500,
+) -> bool:
+    log("开始同步结果表仓库名称：仅补齐 warehouse_name 为空的记录。")
+    last_id = 0
+    checked = updated = unmatched = 0
+
+    while True:
+        if should_stop():
+            log("收到暂停请求，仓库名称同步已停止，本次不会继续打标。")
+            return True
+
+        with target_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  id, source_key, input_hash,
+                  data_source, channel, platform_order_no, sub_order_no,
+                  register_time, raw_feedback
+                FROM voc_tag_result
+                WHERE source_table = %s
+                  AND id > %s
+                  AND (warehouse_name IS NULL OR TRIM(warehouse_name) = '')
+                ORDER BY id
+                LIMIT %s
+                """,
+                (source_table, last_id, batch_size),
+            )
+            result_rows = list(cur.fetchall())
+
+        if not result_rows:
+            break
+
+        last_id = int(result_rows[-1]["id"])
+        source_rows = source_rows_for_warehouse_sync(source_conn, source_table, result_rows)
+        lookup = warehouse_source_lookup(source_rows)
+        updates: list[tuple[str, int]] = []
+        for result_row in result_rows:
+            source_row = matching_warehouse_source(result_row, lookup)
+            warehouse_name = normalize_text(source_row.get("warehouse_name")) if source_row else ""
+            if warehouse_name:
+                updates.append((warehouse_name, int(result_row["id"])))
+            else:
+                unmatched += 1
+
+        checked += len(result_rows)
+        updated += len(updates)
+        if updates and not dry_run:
+            with target_conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    UPDATE voc_tag_result
+                    SET warehouse_name = %s,
+                        update_time = CURRENT_TIMESTAMP
+                    WHERE id = %s
+                      AND (warehouse_name IS NULL OR TRIM(warehouse_name) = '')
+                    """,
+                    updates,
+                )
+            target_conn.commit()
+
+    log(
+        f"仓库名称同步完成：检查={checked}, {'可更新' if dry_run else '已更新'}={updated}, "
+        f"未匹配或源仓库为空={unmatched}, dry_run={dry_run}"
+    )
+    return False
+
+
 def matching_result_rows(
     target_conn,
     source_table: str,
@@ -1247,6 +1414,17 @@ def run_batch(values: dict[str, str], log, should_stop=None) -> None:
     batch_id = f"voc-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
     try:
+        sync_stopped = sync_missing_warehouse_names(
+            source_conn,
+            target_conn,
+            source_table,
+            log,
+            dry_run,
+            should_stop,
+        )
+        if sync_stopped:
+            return
+
         labels, labels_from_cache = load_labels(target_conn, label_version)
         if not labels:
             raise RuntimeError(f"标签知识库没有启用标签：label_version={label_version}")
@@ -1407,7 +1585,7 @@ class VocTaggerApp:
         run_frame.columnconfigure(1, weight=1)
         self._add_entry(run_frame, 0, "标签版本", "label_version", "2026-05-20")
         self._add_entry(run_frame, 1, "本批数量", "batch_limit", "20")
-        self._add_entry(run_frame, 2, "登记月份", "register_month", "2026年04月")
+        self._add_entry(run_frame, 2, "登记月份（留空=全部）", "register_month", "")
         self.vars["use_ai"] = tk.StringVar(value="1")
         self.vars["dry_run"] = tk.StringVar(value="1")
         ttk.Checkbutton(run_frame, text="启用 AI 兜底", variable=self.vars["use_ai"], onvalue="1", offvalue="0").grid(row=0, column=2, sticky="w", padx=12)
