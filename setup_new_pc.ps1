@@ -14,6 +14,8 @@ $tempRoot = Join-Path $runtimeRoot "setup-temp"
 $downloadZip = Join-Path $tempRoot "runtime.zip"
 $extractRoot = Join-Path $tempRoot "extract"
 $repository = "1F0cus1/voc-ai-"
+$version = (Get-Content -LiteralPath (Join-Path $repoRoot "VERSION") -Raw).Trim()
+$assetName = "voc_tagger_windows_x64_v$version.zip"
 
 function Test-Runtime {
     if (-not (Test-Path -LiteralPath $pythonExe)) {
@@ -53,28 +55,16 @@ try {
         Copy-Item -LiteralPath $resolvedArchive -Destination $downloadZip
         Write-Host "Using local release archive: $resolvedArchive"
     } else {
-        Write-Host "Reading the latest GitHub release..."
-        $release = Invoke-RestMethod `
-            -Uri "https://api.github.com/repos/$repository/releases/latest" `
-            -Headers @{ "User-Agent" = "voc-ai-setup" }
-        $asset = $release.assets | Where-Object { $_.name -like "voc_tagger_windows_x64_*.zip" } | Select-Object -First 1
-        if (-not $asset) {
-            throw "The latest release does not contain a Windows portable package."
-        }
-
-        Write-Host "Downloading $($asset.name)..."
+        $releaseBaseUrl = "https://github.com/$repository/releases/download/v$version"
+        Write-Host "Downloading $assetName..."
         Invoke-WebRequest `
-            -Uri $asset.browser_download_url `
+            -Uri "$releaseBaseUrl/$assetName" `
             -OutFile $downloadZip `
             -Headers @{ "User-Agent" = "voc-ai-setup" }
 
-        $checksumAsset = $release.assets | Where-Object { $_.name -eq "$($asset.name).sha256" } | Select-Object -First 1
-        if (-not $checksumAsset) {
-            throw "The release checksum file is missing."
-        }
         $checksumPath = Join-Path $tempRoot "runtime.sha256"
         Invoke-WebRequest `
-            -Uri $checksumAsset.browser_download_url `
+            -Uri "$releaseBaseUrl/$assetName.sha256" `
             -OutFile $checksumPath `
             -Headers @{ "User-Agent" = "voc-ai-setup" }
         $ExpectedSha256 = ((Get-Content -LiteralPath $checksumPath -Raw).Trim() -split '\s+')[0]

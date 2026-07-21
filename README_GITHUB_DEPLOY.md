@@ -12,7 +12,7 @@ cd D:\VOC-AI
 .\setup_new_pc.bat
 ```
 
-`setup_new_pc.bat`会从最新GitHub Release下载Windows便携包，校验SHA256，只提取Python运行环境到`.runtime\python`，然后打开桌面配置工具。
+`setup_new_pc.bat`会根据仓库中的`VERSION`从对应GitHub Release下载Windows便携包，校验SHA256，只提取Python运行环境到`.runtime\python`，然后打开桌面配置工具。
 
 第一次打开桌面端后：
 
