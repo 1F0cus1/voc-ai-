@@ -21,7 +21,7 @@ cd D:\VOC-AI
 3. 先使用Dry-run和5条小批量测试。
 4. 验证后取消Dry-run并保存配置。
 5. 手工运行一次`run_once.bat`。
-6. 运行`install_schedule.bat`创建Windows定时任务。
+6. 运行`install_schedule.bat`创建Windows定时任务。任务会按设定时间运行，并在当前Windows用户每次登录后自动补跑一次。
 
 每台电脑都要重新填写一次密码和API Key，因为它们由当前Windows用户加密，不能跨电脑解密。
 
@@ -42,11 +42,15 @@ update_code.bat
 
 如果受Git管理的代码被手工修改，更新脚本会停止，避免覆盖本地改动。
 
+如果更新内容修改了定时任务设置，请再运行一次`install_schedule.bat`，用新设置覆盖原任务。日常代码更新不需要重新填写数据库或AI配置。
+
 ## 日常使用
 
-- `start_desktop.bat`：打开桌面配置和手工调试。
+- `start_desktop.bat`：打开桌面配置和手工调试；首次运行会自动准备便携Python环境。
+- `start_voc_ai_tagger.bat`：兼容旧入口，功能与`start_desktop.bat`相同。
 - `run_once.bat`：无界面执行一个批次。
 - `install_schedule.bat`：创建或修改定时任务。
+- `start_voc_scheduler.bat`：兼容旧入口，功能与`install_schedule.bat`相同。
 - `remove_schedule.bat`：删除定时任务。
 - `update_code.bat`：拉取最新代码。
 
