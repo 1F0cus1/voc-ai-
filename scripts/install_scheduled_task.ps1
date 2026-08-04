@@ -32,7 +32,7 @@ if ($Mode -eq "Daily") {
     } catch {
         throw "Time must use HH:mm, for example 02:00."
     }
-    $trigger = New-ScheduledTaskTrigger -Daily -At $at
+    $scheduleTrigger = New-ScheduledTaskTrigger -Daily -At $at
     $scheduleText = "every day at $DailyTime"
 } else {
     if (-not $EveryMinutes) {
@@ -42,7 +42,7 @@ if ($Mode -eq "Daily") {
     if ($EveryMinutes -lt 5) {
         throw "The interval must be at least 5 minutes."
     }
-    $trigger = New-ScheduledTaskTrigger `
+    $scheduleTrigger = New-ScheduledTaskTrigger `
         -Once `
         -At (Get-Date).AddMinutes(1) `
         -RepetitionInterval (New-TimeSpan -Minutes $EveryMinutes)
@@ -55,6 +55,8 @@ $action = New-ScheduledTaskAction `
     -WorkingDirectory $packageDir
 
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+$triggers = @($scheduleTrigger, $logonTrigger)
 $principal = New-ScheduledTaskPrincipal `
     -UserId $currentUser `
     -LogonType Interactive `
@@ -71,7 +73,7 @@ $settings = New-ScheduledTaskSettingsSet `
 
 $task = New-ScheduledTask `
     -Action $action `
-    -Trigger $trigger `
+    -Trigger $triggers `
     -Principal $principal `
     -Settings $settings `
     -Description "Run one VOC AI tagging batch with the portable package."
@@ -79,4 +81,5 @@ $task = New-ScheduledTask `
 Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
 Write-Host "Scheduled task created: $taskName ($scheduleText)"
 Write-Host "Windows user: $currentUser"
+Write-Host "The task also runs once whenever this Windows user logs on."
 Write-Host "The task runs only while this user is logged on, so DPAPI secrets can be decrypted."
