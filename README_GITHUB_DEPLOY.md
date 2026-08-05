@@ -21,7 +21,7 @@ cd D:\VOC-AI
 3. 先使用Dry-run和5条小批量测试。
 4. 验证后取消Dry-run并保存配置。
 5. 手工运行一次`run_once.bat`。
-6. 运行`install_schedule.bat`创建Windows定时任务。任务会按设定时间运行，并在当前Windows用户每次登录后自动补跑一次。
+6. 运行`install_schedule.bat`创建Windows定时任务。脚本会自动申请管理员权限、清理旧任务的排队实例，并在当前Windows用户每次登录后自动补跑一次。
 
 每台电脑都要重新填写一次密码和API Key，因为它们由当前Windows用户加密，不能跨电脑解密。
 
@@ -55,3 +55,5 @@ update_code.bat
 - `update_code.bat`：拉取最新代码。
 
 每次批次会先补齐`voc_tag_result.warehouse_name`为空的历史结果，再开始VOC打标。Dry-run只统计可补齐数量，不更新数据库。
+
+PowerShell查看UTF-8日志时请指定编码，例如：`Get-Content .\logs\voc_run_20260805.log -Encoding UTF8 -Tail 30`。

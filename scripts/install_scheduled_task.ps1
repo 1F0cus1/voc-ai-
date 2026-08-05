@@ -60,7 +60,7 @@ $triggers = @($scheduleTrigger, $logonTrigger)
 $principal = New-ScheduledTaskPrincipal `
     -UserId $currentUser `
     -LogonType Interactive `
-    -RunLevel Limited
+    -RunLevel Highest
 
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -78,8 +78,19 @@ $task = New-ScheduledTask `
     -Settings $settings `
     -Description "Run one VOC AI tagging batch with the portable package."
 
+$existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($existingTask) {
+    if ($existingTask.State -eq "Running") {
+        throw "The existing task is running. Wait for the batch to finish, then install the schedule again."
+    }
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    Write-Host "Removed the previous scheduled task and any queued instances."
+}
+
 Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
 Write-Host "Scheduled task created: $taskName ($scheduleText)"
 Write-Host "Windows user: $currentUser"
+Write-Host "Run level: highest privileges"
 Write-Host "The task also runs once whenever this Windows user logs on."
 Write-Host "The task runs only while this user is logged on, so DPAPI secrets can be decrypted."
