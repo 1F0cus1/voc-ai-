@@ -6,9 +6,9 @@ What it does:
 2. Selects rows from configurable source wide table where:
    - raw_feedback is not empty
    - level4_category is empty
-   - voc_tag_result has no row for the selected label_version
+   - the configured result table has no row for the selected label_version
 3. Tags each row with one four-level label.
-4. Writes results into voc_tag_result.
+4. Writes results into the configured result table.
 
 Dependencies:
     pip install pymysql
@@ -23,6 +23,7 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -60,6 +61,9 @@ LABEL_CACHE: dict[str, dict[str, Any]] = {}
 SENSITIVE_CONFIG_KEYS = {"source_db_password", "target_db_password", "db_password", "api_key"}
 DPAPI_PREFIX = "dpapi:v1:"
 DEFAULT_SOURCE_TABLE_NAME = "dwd_rpa_voc_business"
+DEFAULT_RESULT_TABLE_NAME = "voc_tag_result"
+DEFAULT_RESULT_DB_CONNECTION = "target"
+DEFAULT_RESULT_WRITE_MODE = "mysql"
 DEFAULT_SYSTEM_PROMPT = (
     "\u4f60\u662fVOC\u56db\u7ea7\u6807\u7b7e\u5206\u7c7b\u5668\u3002"
     "\u8bf7\u6839\u636e\u7528\u6237\u8bc4\u8bba\uff0c\u4ece\u7ed9\u5b9a\u5019\u9009\u6807\u7b7e\u4e2d\u53ea\u9009\u62e9\u4e00\u4e2a\u6700\u5408\u9002\u7684\u56db\u7ea7\u7c7b\u76ee\uff0c\u4e0d\u80fd\u521b\u9020\u65b0\u6807\u7b7e\u3002"
@@ -169,6 +173,15 @@ def business_identity(row: dict[str, Any]) -> tuple[str, ...]:
 def business_input_hash(row: dict[str, Any]) -> str:
     payload = json.dumps(business_identity(row), ensure_ascii=False, separators=(",", ":"))
     return md5_text(payload)
+
+
+def stable_result_id(source_table: str, label_version: str, input_hash: str) -> int:
+    payload = json.dumps(
+        (source_table.strip(), label_version.strip(), input_hash.strip()),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return int(md5_text(payload)[:15], 16) or 1
 
 
 def input_hashes_for_row(row: dict[str, Any]) -> list[str]:
@@ -345,11 +358,41 @@ def build_db_config(values: dict[str, str], prefix: str) -> dict[str, Any]:
     }
 
 
-def source_table_name(values: dict[str, str]) -> str:
-    table_name = (values.get("source_table_name") or DEFAULT_SOURCE_TABLE_NAME).strip()
-    if not re.fullmatch(r"[A-Za-z0-9_.]+", table_name):
-        raise ValueError("宽表表名只能包含字母、数字、下划线和点号")
+def validated_table_name(value: str, default: str, field_label: str) -> str:
+    table_name = (value or default).strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?", table_name):
+        raise ValueError(f"{field_label}只能填写表名或库名.表名")
     return table_name
+
+
+def source_table_name(values: dict[str, str]) -> str:
+    return validated_table_name(
+        values.get("source_table_name", ""),
+        DEFAULT_SOURCE_TABLE_NAME,
+        "宽表表名",
+    )
+
+
+def result_table_name(values: dict[str, str]) -> str:
+    return validated_table_name(
+        values.get("result_table_name", ""),
+        DEFAULT_RESULT_TABLE_NAME,
+        "结果表表名",
+    )
+
+
+def result_db_connection(values: dict[str, str]) -> str:
+    value = (values.get("result_db_connection", "") or DEFAULT_RESULT_DB_CONNECTION).strip().lower()
+    if value not in {"source", "target"}:
+        raise ValueError("结果表连接只能选择 source 或 target")
+    return value
+
+
+def result_write_mode(values: dict[str, str]) -> str:
+    value = (values.get("result_write_mode", "") or DEFAULT_RESULT_WRITE_MODE).strip().lower()
+    if value not in {"mysql", "primary_key"}:
+        raise ValueError("结果表写入模式只能选择 mysql 或 primary_key")
+    return value
 
 
 class DataBlob(ctypes.Structure):
@@ -639,7 +682,8 @@ def sync_missing_warehouse_names(
 
 
 def matching_result_rows(
-    target_conn,
+    result_conn,
+    result_table: str,
     source_table: str,
     label_version: str,
     input_hashes: list[str],
@@ -674,20 +718,27 @@ def matching_result_rows(
           sub_order_no,
           register_time,
           raw_feedback
-        FROM voc_tag_result
+        FROM {result_table}
         WHERE source_table = %s
           AND label_version = %s
           AND {status_clause}
           AND ({" OR ".join(match_clauses)})
     """
-    with target_conn.cursor() as cur:
+    with result_conn.cursor() as cur:
         cur.execute(sql, params)
         return list(cur.fetchall())
 
 
-def find_failed_result_id(conn, row: dict[str, Any], source_table: str, label_version: str) -> int | None:
+def find_failed_result_id(
+    conn,
+    row: dict[str, Any],
+    result_table: str,
+    source_table: str,
+    label_version: str,
+) -> int | None:
     rows = matching_result_rows(
         conn,
+        result_table,
         source_table,
         label_version,
         input_hashes_for_row(row),
@@ -702,8 +753,9 @@ def find_failed_result_id(conn, row: dict[str, Any], source_table: str, label_ve
 
 def fetch_pending_rows(
     source_conn,
-    target_conn,
+    result_conn,
     source_table: str,
+    result_table: str,
     label_version: str,
     register_month: str,
     limit: int,
@@ -749,7 +801,8 @@ def fetch_pending_rows(
 
         last_key = str(rows[-1]["voc_hash"])
         existing_rows = matching_result_rows(
-            target_conn,
+            result_conn,
+            result_table,
             source_table,
             label_version,
             [value for row in rows for value in input_hashes_for_row(row)],
@@ -1233,37 +1286,19 @@ def insert_result(
     conn,
     row: dict[str, Any],
     result: TagResult,
+    result_table: str,
     source_table: str,
     label_version: str,
     batch_id: str,
     request_id: str,
+    write_mode: str = DEFAULT_RESULT_WRITE_MODE,
 ) -> None:
-    sql = """
-        INSERT INTO voc_tag_result (
-          source_table, source_id, source_key,
-          data_source, channel, brand, shop_name, register_month, register_time,
-          platform_order_no, sub_order_no, sku_code, product_name, warehouse_name, raw_feedback,
-          input_hash,
-          label_version, label_source, taxonomy_label_id,
-          level1_name, level2_name, level3_name, level4_name,
-          is_valid_voc, is_irrelevant,
-          confidence, matched_keywords, candidate_labels, reason,
-          model_name, prompt_version, rule_version, ai_response,
-          tag_batch_id, request_id,
-          tag_status, review_required, review_status, error_message
-        ) VALUES (
-          %(source_table)s, %(source_id)s, %(source_key)s,
-          %(data_source)s, %(channel)s, %(brand)s, %(shop_name)s, %(register_month)s, %(register_time)s,
-          %(platform_order_no)s, %(sub_order_no)s, %(sku_code)s, %(product_name)s, %(warehouse_name)s, %(raw_feedback)s,
-          %(input_hash)s,
-          %(label_version)s, %(label_source)s, %(taxonomy_label_id)s,
-          %(level1_name)s, %(level2_name)s, %(level3_name)s, %(level4_name)s,
-          %(is_valid_voc)s, %(is_irrelevant)s,
-          %(confidence)s, %(matched_keywords)s, %(candidate_labels)s, %(reason)s,
-          %(model_name)s, %(prompt_version)s, %(rule_version)s, %(ai_response)s,
-          %(tag_batch_id)s, %(request_id)s,
-          %(tag_status)s, %(review_required)s, %(review_status)s, %(error_message)s
-        )
+    write_mode = result_write_mode({"result_write_mode": write_mode})
+    id_column = "          id,\n" if write_mode == "primary_key" else ""
+    id_value = "          %(id)s,\n" if write_mode == "primary_key" else ""
+    upsert_clause = ""
+    if write_mode == "mysql":
+        upsert_clause = """
         ON DUPLICATE KEY UPDATE
           source_id = VALUES(source_id),
           source_key = VALUES(source_key),
@@ -1303,8 +1338,36 @@ def insert_result(
           review_status = VALUES(review_status),
           error_message = VALUES(error_message),
           update_time = CURRENT_TIMESTAMP
+        """
+    sql = f"""
+        INSERT INTO {result_table} (
+{id_column}          source_table, source_id, source_key,
+          data_source, channel, brand, shop_name, register_month, register_time,
+          platform_order_no, sub_order_no, sku_code, product_name, warehouse_name, raw_feedback,
+          input_hash,
+          label_version, label_source, taxonomy_label_id,
+          level1_name, level2_name, level3_name, level4_name,
+          is_valid_voc, is_irrelevant,
+          confidence, matched_keywords, candidate_labels, reason,
+          model_name, prompt_version, rule_version, ai_response,
+          tag_batch_id, request_id,
+          tag_status, review_required, review_status, error_message
+        ) VALUES (
+{id_value}          %(source_table)s, %(source_id)s, %(source_key)s,
+          %(data_source)s, %(channel)s, %(brand)s, %(shop_name)s, %(register_month)s, %(register_time)s,
+          %(platform_order_no)s, %(sub_order_no)s, %(sku_code)s, %(product_name)s, %(warehouse_name)s, %(raw_feedback)s,
+          %(input_hash)s,
+          %(label_version)s, %(label_source)s, %(taxonomy_label_id)s,
+          %(level1_name)s, %(level2_name)s, %(level3_name)s, %(level4_name)s,
+          %(is_valid_voc)s, %(is_irrelevant)s,
+          %(confidence)s, %(matched_keywords)s, %(candidate_labels)s, %(reason)s,
+          %(model_name)s, %(prompt_version)s, %(rule_version)s, %(ai_response)s,
+          %(tag_batch_id)s, %(request_id)s,
+          %(tag_status)s, %(review_required)s, %(review_status)s, %(error_message)s
+        ){upsert_clause}
     """
     raw_feedback = normalize_text(row.get("raw_feedback"))
+    input_hash = business_input_hash(row)
     params = {
         "source_id": None,
         "source_key": source_key_value(row),
@@ -1321,7 +1384,7 @@ def insert_result(
         "product_name": row.get("product_name"),
         "warehouse_name": row.get("warehouse_name"),
         "raw_feedback": raw_feedback,
-        "input_hash": business_input_hash(row),
+        "input_hash": input_hash,
         "label_version": label_version,
         "label_source": result.label_source,
         "taxonomy_label_id": result.taxonomy_label_id,
@@ -1346,12 +1409,18 @@ def insert_result(
         "review_status": "pending" if result.review_required else "none",
         "error_message": result.error_message,
     }
-    retry_result_id = find_failed_result_id(conn, row, source_table, label_version)
+    if write_mode == "primary_key":
+        params["id"] = stable_result_id(source_table, label_version, input_hash)
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+        return
+
+    retry_result_id = find_failed_result_id(conn, row, result_table, source_table, label_version)
     with conn.cursor() as cur:
         if retry_result_id:
             params["id"] = retry_result_id
-            update_sql = """
-                UPDATE voc_tag_result
+            update_sql = f"""
+                UPDATE {result_table}
                 SET
                   source_table = %(source_table)s,
                   source_id = %(source_id)s,
@@ -1403,27 +1472,38 @@ def insert_result(
 def run_batch(values: dict[str, str], log, should_stop=None) -> None:
     if should_stop is None:
         should_stop = lambda: False
-    source_conn = connect_db(values, "source")
-    target_conn = connect_db(values, "target")
     source_table = source_table_name(values)
+    result_table = result_table_name(values)
+    result_connection = result_db_connection(values)
+    write_mode = result_write_mode(values)
     label_version = values["label_version"].strip()
     register_month = values.get("register_month", "").strip()
     limit = int(values["batch_limit"].strip() or "20")
     use_ai = values.get("use_ai") == "1"
     dry_run = values.get("dry_run") == "1"
     batch_id = f"voc-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    source_conn = None
+    target_conn = None
 
     try:
-        sync_stopped = sync_missing_warehouse_names(
-            source_conn,
-            target_conn,
-            source_table,
-            log,
-            dry_run,
-            should_stop,
-        )
-        if sync_stopped:
-            return
+        source_conn = connect_db(values, "source")
+        target_conn = connect_db(values, "target")
+        result_conn = source_conn if result_connection == "source" else target_conn
+        if (
+            result_connection == "target"
+            and write_mode == "mysql"
+            and result_table == DEFAULT_RESULT_TABLE_NAME
+        ):
+            sync_stopped = sync_missing_warehouse_names(
+                source_conn,
+                result_conn,
+                source_table,
+                log,
+                dry_run,
+                should_stop,
+            )
+            if sync_stopped:
+                return
 
         labels, labels_from_cache = load_labels(target_conn, label_version)
         if not labels:
@@ -1431,9 +1511,21 @@ def run_batch(values: dict[str, str], log, should_stop=None) -> None:
         cache_text = "缓存命中" if labels_from_cache else "重新加载"
         log(f"已加载标签 {len(labels)} 条，版本：{label_version}（{cache_text}）")
 
-        rows = fetch_pending_rows(source_conn, target_conn, source_table, label_version, register_month, limit)
+        rows = fetch_pending_rows(
+            source_conn,
+            result_conn,
+            source_table,
+            result_table,
+            label_version,
+            register_month,
+            limit,
+        )
         month_text = register_month if register_month else "全部月份"
-        log(f"待处理宽表记录 {len(rows)} 条，来源表：{source_table}，月份：{month_text}。批次：{batch_id}")
+        log(
+            f"待处理宽表记录 {len(rows)} 条，来源表：{source_table}，"
+            f"结果表：{result_table}（{result_connection}/{write_mode}），"
+            f"月份：{month_text}。批次：{batch_id}"
+        )
         if not rows:
             return
 
@@ -1478,8 +1570,18 @@ def run_batch(values: dict[str, str], log, should_stop=None) -> None:
                         f"source={result.label_source} confidence={result.confidence}"
                     )
                 else:
-                    insert_result(target_conn, row, result, source_table, label_version, batch_id, request_id)
-                    target_conn.commit()
+                    insert_result(
+                        result_conn,
+                        row,
+                        result,
+                        result_table,
+                        source_table,
+                        label_version,
+                        batch_id,
+                        request_id,
+                        write_mode,
+                    )
+                    result_conn.commit()
                     log(
                         f"[{index}/{len(rows)}] voc_hash={source_key} -> "
                         f"{result.level1_name}/{result.level2_name}/{result.level3_name}/{result.level4_name} "
@@ -1493,27 +1595,48 @@ def run_batch(values: dict[str, str], log, should_stop=None) -> None:
                 else:
                     done += 1
             except Exception as exc:
-                target_conn.rollback()
+                result_conn.rollback()
                 failed += 1
                 error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
                 fail_result = make_failed_result(error)
                 if not dry_run:
-                    insert_result(target_conn, row, fail_result, source_table, label_version, batch_id, request_id)
-                    target_conn.commit()
+                    insert_result(
+                        result_conn,
+                        row,
+                        fail_result,
+                        result_table,
+                        source_table,
+                        label_version,
+                        batch_id,
+                        request_id,
+                        write_mode,
+                    )
+                    result_conn.commit()
                 log(f"[失败 {index}/{len(rows)}] voc_hash={source_key}: {error}")
 
             time.sleep(float(values["sleep_seconds"].strip() or "0"))
 
         log(f"批次完成：done={done}, review={review}, failed={failed}, dry_run={dry_run}")
     finally:
-        source_conn.close()
-        target_conn.close()
+        if source_conn:
+            source_conn.close()
+        if target_conn:
+            target_conn.close()
 
 
 class VocTaggerApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(
+        self,
+        root: tk.Tk,
+        config_path: Path = CONFIG_PATH,
+        profile_name: str = "",
+        profile_defaults: dict[str, str] | None = None,
+    ):
         self.root = root
-        self.root.title("VOC AI 打标控制器 - 双数据库测试版")
+        self.config_path = Path(config_path).resolve()
+        self.profile_defaults = profile_defaults or {}
+        title_suffix = profile_name.strip() or "默认配置"
+        self.root.title(f"VOC AI 打标控制器 - {title_suffix}")
         self.root.geometry("980x720")
         self.root.minsize(860, 560)
         self.vars: dict[str, tk.StringVar] = {}
@@ -1560,9 +1683,15 @@ class VocTaggerApp:
         self._add_entry(source_db_frame, 2, "User", "source_db_user", "root")
         self._add_entry(source_db_frame, 3, "Password", "source_db_password", "", show="*")
         self._add_entry(source_db_frame, 4, "DB Name", "source_db_name", "")
-        self._add_entry(source_db_frame, 5, "宽表表名", "source_table_name", DEFAULT_SOURCE_TABLE_NAME)
+        self._add_entry(
+            source_db_frame,
+            5,
+            "宽表表名",
+            "source_table_name",
+            self.profile_defaults.get("source_table_name", DEFAULT_SOURCE_TABLE_NAME),
+        )
 
-        target_db_frame = ttk.LabelFrame(frame, text="知识库/结果数据库", padding=8)
+        target_db_frame = ttk.LabelFrame(frame, text="标签知识库 / 结果设置", padding=8)
         target_db_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
         target_db_frame.columnconfigure(1, weight=1)
         self._add_entry(target_db_frame, 0, "Host", "target_db_host", "127.0.0.1")
@@ -1570,13 +1699,54 @@ class VocTaggerApp:
         self._add_entry(target_db_frame, 2, "User", "target_db_user", "root")
         self._add_entry(target_db_frame, 3, "Password", "target_db_password", "", show="*")
         self._add_entry(target_db_frame, 4, "DB Name", "target_db_name", "")
+        self._add_entry(
+            target_db_frame,
+            5,
+            "结果表表名",
+            "result_table_name",
+            self.profile_defaults.get("result_table_name", DEFAULT_RESULT_TABLE_NAME),
+        )
+        ttk.Label(target_db_frame, text="结果表连接").grid(row=6, column=0, sticky="w", padx=6, pady=3)
+        self.vars["result_db_connection"] = tk.StringVar(
+            value=self.profile_defaults.get("result_db_connection", DEFAULT_RESULT_DB_CONNECTION)
+        )
+        ttk.Combobox(
+            target_db_frame,
+            textvariable=self.vars["result_db_connection"],
+            values=("target", "source"),
+            state="readonly",
+            width=35,
+        ).grid(row=6, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Label(target_db_frame, text="结果表写入模式").grid(row=7, column=0, sticky="w", padx=6, pady=3)
+        self.vars["result_write_mode"] = tk.StringVar(
+            value=self.profile_defaults.get("result_write_mode", DEFAULT_RESULT_WRITE_MODE)
+        )
+        ttk.Combobox(
+            target_db_frame,
+            textvariable=self.vars["result_write_mode"],
+            values=("mysql", "primary_key"),
+            state="readonly",
+            width=35,
+        ).grid(row=7, column=1, sticky="ew", padx=6, pady=3)
 
         ai_frame = ttk.LabelFrame(frame, text="AI 设置", padding=8)
         ai_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
         ai_frame.columnconfigure(1, weight=1)
-        self._add_entry(ai_frame, 0, "API Base URL", "api_base_url", "https://api.openai.com/v1")
+        self._add_entry(
+            ai_frame,
+            0,
+            "API Base URL",
+            "api_base_url",
+            self.profile_defaults.get("api_base_url", "https://api.openai.com/v1"),
+        )
         self._add_entry(ai_frame, 1, "API Key", "api_key", "", show="*")
-        self._add_entry(ai_frame, 2, "Model", "model_name", "gpt-4.1-mini")
+        self._add_entry(
+            ai_frame,
+            2,
+            "Model",
+            "model_name",
+            self.profile_defaults.get("model_name", "gpt-4.1-mini"),
+        )
         self._add_entry(ai_frame, 3, "Timeout 秒", "api_timeout", "60")
         self._add_entry(ai_frame, 4, "每条间隔 秒", "sleep_seconds", "0")
 
@@ -1635,12 +1805,15 @@ class VocTaggerApp:
         self.root.update_idletasks()
 
     def _load_config(self):
-        if not CONFIG_PATH.exists():
+        if not self.config_path.exists():
+            self.log(f"配置文件尚未创建：{self.config_path}")
             return
         try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
+            data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.log(f"配置读取失败：{self.config_path}；{exc}")
             return
+        decrypt_failed = False
         for key, value in data.items():
             if key in SENSITIVE_CONFIG_KEYS:
                 if isinstance(value, str):
@@ -1648,6 +1821,7 @@ class VocTaggerApp:
                         value = decrypt_secret(value)
                     except Exception:
                         value = ""
+                        decrypt_failed = True
                 else:
                     value = ""
             if key in self.vars:
@@ -1655,13 +1829,21 @@ class VocTaggerApp:
             elif key in self.text_widgets:
                 self.text_widgets[key].delete("1.0", "end")
                 self.text_widgets[key].insert("1.0", str(value))
+        if decrypt_failed:
+            self.log("部分密码或 API Key 无法由当前 Windows 用户解密，请重新填写并保存。")
 
     def save_config(self):
         values = self.values()
         for key in SENSITIVE_CONFIG_KEYS:
             values[key] = encrypt_secret(values.get(key, ""))
-        CONFIG_PATH.write_text(json.dumps(values, ensure_ascii=False, indent=2), encoding="utf-8")
-        messagebox.showinfo("已保存", f"配置已保存到：{CONFIG_PATH}\n数据库密码和 API Key 已使用当前 Windows 用户加密。")
+        self.config_path.write_text(
+            json.dumps(values, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        messagebox.showinfo(
+            "已保存",
+            f"配置已保存到：{self.config_path}\n数据库密码和 API Key 已使用当前 Windows 用户加密。",
+        )
 
     def test_db(self):
         source_conn = None
@@ -1669,6 +1851,8 @@ class VocTaggerApp:
         try:
             values = self.values()
             source_table = source_table_name(values)
+            result_table = result_table_name(values)
+            result_connection = result_db_connection(values)
             source_conn = connect_db(values, "source")
             with source_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) AS cnt FROM {source_table}")
@@ -1678,10 +1862,18 @@ class VocTaggerApp:
             with target_conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) AS cnt FROM voc_label_taxonomy")
                 label_count = cur.fetchone()["cnt"]
-                cur.execute("SELECT COUNT(*) AS cnt FROM voc_tag_result")
+
+            result_conn = source_conn if result_connection == "source" else target_conn
+            with result_conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) AS cnt FROM {result_table}")
                 result_count = cur.fetchone()["cnt"]
 
-            messagebox.showinfo("连接成功", f"来源表 {source_table}：{wide_count} 行\n标签知识库：{label_count} 行\n打标结果表：{result_count} 行")
+            messagebox.showinfo(
+                "连接成功",
+                f"来源表 {source_table}：{wide_count} 行\n"
+                f"标签知识库：{label_count} 行\n"
+                f"结果表 {result_table}（{result_connection}）：{result_count} 行",
+            )
         except Exception as exc:
             messagebox.showerror("连接失败", str(exc))
         finally:
@@ -1752,8 +1944,22 @@ class VocTaggerApp:
         if self.running:
             messagebox.showwarning("正在运行", "当前批次还在运行。")
             return
+        try:
+            values = self.values()
+            source_table = source_table_name(values)
+            result_table = result_table_name(values)
+            result_connection = result_db_connection(values)
+            write_mode = result_write_mode(values)
+        except ValueError as exc:
+            messagebox.showwarning("配置错误", str(exc))
+            return
         if self.vars["dry_run"].get() != "1":
-            if not messagebox.askyesno("确认写库", "当前不是 Dry-run，会写入 voc_tag_result。确认开始吗？"):
+            if not messagebox.askyesno(
+                "确认写库",
+                f"当前不是 Dry-run。\n来源表：{source_table}\n"
+                f"结果表：{result_table}\n结果连接：{result_connection}\n"
+                f"写入模式：{write_mode}\n确认开始吗？",
+            ):
                 return
 
         self.running = True
@@ -1781,9 +1987,54 @@ class VocTaggerApp:
             self.start_btn.configure(state="normal")
             self.pause_btn.configure(state="disabled")
 
-def main():
+def parse_runtime_args(argv=None):
+    parser = argparse.ArgumentParser(description="VOC AI 打标控制器")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=CONFIG_PATH,
+        help="当前打标器使用的独立配置文件",
+    )
+    parser.add_argument(
+        "--profile-name",
+        default="",
+        help="显示在窗口标题中的配置名称",
+    )
+    parser.add_argument("--default-source-table", default=DEFAULT_SOURCE_TABLE_NAME)
+    parser.add_argument("--default-result-table", default=DEFAULT_RESULT_TABLE_NAME)
+    parser.add_argument(
+        "--default-result-db-connection",
+        default=DEFAULT_RESULT_DB_CONNECTION,
+        choices=("target", "source"),
+    )
+    parser.add_argument(
+        "--default-result-write-mode",
+        default=DEFAULT_RESULT_WRITE_MODE,
+        choices=("mysql", "primary_key"),
+    )
+    parser.add_argument("--default-api-base-url", default="https://api.openai.com/v1")
+    parser.add_argument("--default-model", default="gpt-4.1-mini")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_runtime_args(argv)
     root = tk.Tk()
-    app = VocTaggerApp(root)
+    profile_defaults = {
+        "source_table_name": args.default_source_table,
+        "result_table_name": args.default_result_table,
+        "result_db_connection": args.default_result_db_connection,
+        "result_write_mode": args.default_result_write_mode,
+        "api_base_url": args.default_api_base_url,
+        "model_name": args.default_model,
+    }
+    app = VocTaggerApp(
+        root,
+        config_path=args.config,
+        profile_name=args.profile_name,
+        profile_defaults=profile_defaults,
+    )
+    app.log(f"当前配置：{args.profile_name or app.config_path.name}")
     app.log("小范围测试建议：先勾选 Dry-run，本批数量设为 5。确认结果后再取消 Dry-run 写库。")
     root.mainloop()
 

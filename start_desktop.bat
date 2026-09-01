@@ -21,5 +21,5 @@ if errorlevel 1 (
   exit /b 1
 )
 
-"%PYTHON_EXE%" "%~dp0scripts\voc_ai_tag_controller.py"
+"%PYTHON_EXE%" "%~dp0scripts\voc_ai_tag_controller.py" %*
 if errorlevel 1 pause

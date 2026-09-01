@@ -12,14 +12,18 @@
 - 支持无关评论识别，例如纯符号、无意义重复字符、闲聊内容等。
 - 支持 Dry-run 小批量测试，不写入数据库。
 - 支持失败记录重试，重试时优先更新原失败记录。
-- 支持桌面版控制器和简易本地调度后台。
+- 支持桌面版控制器和 Windows 定时批处理。
 
 ## 目录结构
 
 ```text
 .
-├─ start_voc_ai_tagger.bat                 # 桌面版启动脚本
-├─ start_voc_scheduler.bat                 # 本地调度后台启动脚本
+├─ start_voc_business_tagger.bat           # 原业务宽表打标器
+├─ start_voc_original_statement_tagger.bat # 原始语句打标器
+├─ start_desktop.bat                       # 两个入口共用的便携桌面启动脚本
+├─ start_voc_ai_tagger.bat                 # 兼容旧桌面入口
+├─ run_once.bat                            # 单配置无界面批处理
+├─ start_voc_scheduler.bat                 # 兼容定时任务安装入口
 ├─ scripts/
 │  ├─ voc_ai_tag_controller.py             # VOC 打标主程序
 │  ├─ voc_scheduler_server.py              # 简易本地调度后台
@@ -36,8 +40,24 @@
 ```text
 dwd_rpa_voc_business       # 来源业务宽表，通常在数仓库
 voc_label_taxonomy         # VOC 标签知识库，通常在结果库
-voc_tag_result             # VOC 打标结果表，通常在结果库
+voc_tag_result             # 默认 VOC 打标结果表，通常在结果库
 ```
+
+来源宽表和结果表均可填写 `表名` 或 `库名.表名`。例如原始语句打标链路：
+
+```text
+rpa.dwd_rpa_voc_original_statement
+  -> rpa.ods_rpa_voc_original_statement_tag_result
+```
+
+标签知识库始终从目标连接读取。结果表可按配置写入目标连接或来源连接：
+
+| 打标器 | 来源表 | 结果表 | 结果连接 | 写入模式 |
+| --- | --- | --- | --- | --- |
+| 原业务宽表 | `dwd_rpa_voc_business` | `voc_tag_result` | `target` | `mysql` |
+| 原始语句 | `rpa.dwd_rpa_voc_original_statement` | `rpa.ods_rpa_voc_original_statement_tag_result` | `source` | `primary_key` |
+
+`mysql` 模式保留原来的 MySQL 重试更新和 `ON DUPLICATE KEY UPDATE`。`primary_key` 模式会生成稳定的正数 `BIGINT id`，使用普通 `INSERT` 交给主键表执行 upsert。
 
 宽表当前以 `voc_hash` 作为来源追溯字段，但程序不会只依赖 `voc_hash` 判断是否重复打标。
 
@@ -56,15 +76,16 @@ voc_tag_result             # VOC 打标结果表，通常在结果库
 
 ### 桌面版
 
-双击：
+两个打标器使用同一套分类代码，但分别保存配置。按需要双击：
 
 ```text
-start_voc_ai_tagger.bat
+start_voc_business_tagger.bat             # dwd_rpa_voc_business -> voc_tag_result
+start_voc_original_statement_tagger.bat   # rpa.dwd_rpa_voc_original_statement -> rpa.ods_rpa_voc_original_statement_tag_result
 ```
 
-桌面版适合人工测试、小批量打标、调试 AI 返回结果。
+两个窗口可同时打开，窗口标题会显示“原业务宽表”或“原始语句”。数据库、Key、模型、月份、批量数、结果连接、写入模式和提示词保存在各自的本地配置文件中，互不覆盖。
 
-### 本地调度后台
+### Windows 定时任务
 
 双击：
 
@@ -72,17 +93,11 @@ start_voc_ai_tagger.bat
 start_voc_scheduler.bat
 ```
 
-启动后在浏览器访问本地后台，用于手动启动、暂停或设置简单定时任务。
+该入口用于安装或更新 Windows 定时任务。当前双配置只作用于桌面版；`run_once.bat` 和定时任务仍使用 `scripts/voc_tagger_config.json` 单配置，默认执行原业务宽表链路。
 
 ## 依赖
 
-需要 Python 3，并安装：
-
-```bash
-pip install pymysql
-```
-
-桌面版启动脚本会在启动前检查 `pymysql`，缺失时自动尝试安装。
+首次使用先运行 `setup_new_pc.bat`。脚本会准备 `.runtime\python` 便携运行环境并校验 `pymysql`、`tkinter`，具体流程见 `README_GITHUB_DEPLOY.md`。
 
 ## 首次使用步骤
 
@@ -101,18 +116,21 @@ scripts/migrate_voc_tag_result_to_voc_hash.sql
 scripts/migrate_voc_tag_result_add_warehouse_name.sql
 ```
 
-3. 启动桌面版：
+3. 启动对应的桌面版：
 
 ```text
-start_voc_ai_tagger.bat
+start_voc_business_tagger.bat
+start_voc_original_statement_tagger.bat
 ```
 
 4. 在界面中填写：
 
 ```text
 来源数据库连接
-结果数据库连接
+目标数据库连接（读取标签知识库）
 来源宽表名
+结果表表名
+结果表连接和写入模式
 标签版本
 register_month
 AI API Key / Base URL / 模型名
@@ -126,39 +144,27 @@ AI API Key / Base URL / 模型名
 
 ```text
 scripts/voc_tagger_config.json
+scripts/voc_business_tagger_config.json
+scripts/voc_original_statement_tagger_config.json
 scripts/voc_scheduler_config.json
 voc_tagger_config.json
 voc_scheduler_config.json
 .env
 ```
 
-这些文件已经写入 `.gitignore`。迁移到其它电脑时，请在新电脑重新填写配置，不要直接复制旧电脑配置文件。
+这些文件已经写入 `.gitignore`。配置中的密码和 Key 使用 Windows DPAPI 加密，不能通过 Git 或直接复制到另一台电脑使用。新电脑拉取代码后，分别启动两个打标器、重新填写数据库密码和 API Key，再各自保存一次。启动脚本会预填正确的表名、结果连接、写入模式、内部 API `/v1` 地址和模型。
 
-## 迁移到另一台电脑
+## 迁移和更新另一台电脑
 
-需要复制以下内容：
+首次安装按 `README_GITHUB_DEPLOY.md` 克隆仓库并运行 `setup_new_pc.bat`。已有安装在本次改动合并到 `master` 后双击 `update_code.bat`，即可通过 `git pull --ff-only` 拉取最新代码。
 
-```text
-start_voc_ai_tagger.bat
-start_voc_scheduler.bat
-scripts/
-README.md
-```
-
-新电脑需要具备：
-
-```text
-Python 3
-pymysql
-能访问来源库、结果库和 AI 接口
-```
-
-如果使用便携 Python，可以把 Python 环境一起放入项目目录，并调整启动脚本中的 Python 路径。
+Git 只同步共享代码、启动入口、测试和文档，不同步上述本地配置文件。更新后分别运行两个桌面入口，在该电脑重新填写数据库密码和 API Key 并保存；该电脑还需要能访问来源库、标签知识库和 AI 接口。
 
 ## 注意事项
 
 - 不要直接在业务宽表上覆盖 AI 打标过程数据。
-- 打标结果优先写入 `voc_tag_result`。
+- 打标结果写入界面中配置的结果表，旧配置默认使用 `voc_tag_result`。
+- 原始语句链路需要来源数据库账号对 `rpa.ods_rpa_voc_original_statement_tag_result` 具备写权限。
 - 宽表中的 `level4_category` 有值时，默认不再打标。
 - 已成功打过的记录不会重复打标。
 - `failed` 状态的记录允许后续重试。
