@@ -5,6 +5,8 @@ __pycache__/
 *.local
 qa-*.png
 scripts/voc_tagger_config.json
+scripts/voc_business_tagger_config.json
+scripts/voc_original_statement_tagger_config.json
 scripts/voc_scheduler_config.json
 voc_tagger_config.json
 voc_scheduler_config.json

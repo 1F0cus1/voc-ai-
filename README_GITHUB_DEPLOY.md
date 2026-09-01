@@ -16,7 +16,7 @@ cd D:\VOC-AI
 
 第一次打开桌面端后：
 
-1. 填写数仓、知识库/结果库和AI接口配置。
+1. 根据需要打开 `start_voc_business_tagger.bat` 或 `start_voc_original_statement_tagger.bat`，填写数仓、标签知识库和AI接口配置。
 2. 登记月份留空，表示全部月份。
 3. 先使用Dry-run和5条小批量测试。
 4. 验证后取消Dry-run并保存配置。
@@ -48,10 +48,12 @@ update_code.bat
 
 - `start_desktop.bat`：打开桌面配置和手工调试；首次运行会自动准备便携Python环境。
 - `start_voc_ai_tagger.bat`：兼容旧入口，功能与`start_desktop.bat`相同。
+- `start_voc_business_tagger.bat`：原业务宽表打标器，使用独立本地配置。
+- `start_voc_original_statement_tagger.bat`：原始语句打标器，使用独立本地配置。
 - `run_once.bat`：无界面执行一个批次。
 - `install_schedule.bat`：创建或修改定时任务。
 - `start_voc_scheduler.bat`：兼容旧入口，功能与`install_schedule.bat`相同。
 - `remove_schedule.bat`：删除定时任务。
 - `update_code.bat`：拉取最新代码。
 
-每次批次会先补齐`voc_tag_result.warehouse_name`为空的历史结果，再开始VOC打标。Dry-run只统计可补齐数量，不更新数据库。
+两个独立配置目前仅用于桌面端。`run_once.bat` 和 Windows 定时任务仍使用 `scripts/voc_tagger_config.json` 单配置。旧业务批次会先补齐`voc_tag_result.warehouse_name`为空的历史结果，再开始VOC打标；Dry-run只统计可补齐数量，不更新数据库。

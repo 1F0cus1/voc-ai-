@@ -13,6 +13,9 @@ from urllib.parse import parse_qs, urlparse
 
 from voc_ai_tag_controller import (
     DEFAULT_DECISION_RULES,
+    DEFAULT_RESULT_DB_CONNECTION,
+    DEFAULT_RESULT_TABLE_NAME,
+    DEFAULT_RESULT_WRITE_MODE,
     DEFAULT_SOURCE_TABLE_NAME,
     DEFAULT_SYSTEM_PROMPT,
     SENSITIVE_CONFIG_KEYS,
@@ -39,6 +42,9 @@ DEFAULT_CONFIG = {
     "target_db_user": "root",
     "target_db_password": "",
     "target_db_name": "",
+    "result_db_connection": DEFAULT_RESULT_DB_CONNECTION,
+    "result_write_mode": DEFAULT_RESULT_WRITE_MODE,
+    "result_table_name": DEFAULT_RESULT_TABLE_NAME,
     "api_base_url": "https://api.openai.com/v1",
     "api_key": "",
     "model_name": "gpt-4.1-mini",
@@ -225,6 +231,19 @@ def render_page(message: str = "") -> str:
         </label>
         """
 
+    def select_row(label: str, key: str, options: tuple[str, ...]) -> str:
+        selected_value = config.get(key, "")
+        option_html = "".join(
+            f'<option value="{esc(option)}"{" selected" if option == selected_value else ""}>{esc(option)}</option>'
+            for option in options
+        )
+        return f"""
+        <label>
+          <span>{esc(label)}</span>
+          <select name="{esc(key)}">{option_html}</select>
+        </label>
+        """
+
     log_text = "\n".join(recent_logs)
     status_color = {
         "running": "#0b72f0",
@@ -248,7 +267,7 @@ def render_page(message: str = "") -> str:
     section {{ background: white; border: 1px solid #d7dce2; border-radius: 8px; padding: 14px; }}
     h2 {{ font-size: 16px; margin: 0 0 12px; }}
     label {{ display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 10px; align-items: center; margin: 8px 0; }}
-    input, textarea {{ width: 100%; box-sizing: border-box; border: 1px solid #c7cdd4; border-radius: 6px; padding: 7px 9px; font: inherit; }}
+    input, select, textarea {{ width: 100%; box-sizing: border-box; border: 1px solid #c7cdd4; border-radius: 6px; padding: 7px 9px; font: inherit; }}
     textarea {{ min-height: 86px; resize: vertical; }}
     .full {{ grid-column: 1 / -1; }}
     .checks label {{ display: inline-flex; grid-template-columns: none; gap: 8px; margin-right: 18px; }}
@@ -299,12 +318,15 @@ def render_page(message: str = "") -> str:
           {input_row("宽表表名", "source_table_name")}
         </section>
         <section>
-          <h2>知识库 / 结果数据库</h2>
+          <h2>标签知识库 / 结果设置</h2>
           {input_row("Host", "target_db_host")}
           {input_row("Port", "target_db_port")}
           {input_row("User", "target_db_user")}
           {input_row("Password", "target_db_password", True)}
           {input_row("DB Name", "target_db_name")}
+          {select_row("结果表连接", "result_db_connection", ("target", "source"))}
+          {select_row("结果写入模式", "result_write_mode", ("mysql", "primary_key"))}
+          {input_row("结果表表名", "result_table_name")}
         </section>
         <section>
           <h2>AI 设置</h2>
