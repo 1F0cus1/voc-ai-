@@ -27,9 +27,11 @@ import argparse
 import hashlib
 import json
 import os
+import queue
 import re
 import socket
 import ssl
+import subprocess
 import threading
 import time
 import traceback
@@ -54,7 +56,11 @@ except ImportError:
 
 
 APP_DIR = Path(__file__).resolve().parent
+PACKAGE_DIR = APP_DIR.parent
 CONFIG_PATH = APP_DIR / "voc_tagger_config.json"
+SCHEDULE_TASK_SCRIPT = APP_DIR / "install_scheduled_task.ps1"
+DEFAULT_SCHEDULE_TASK_NAME = "VOC AI Tagger"
+DEFAULT_PROFILE_ID = "business"
 PROMPT_VERSION = "voc_prompt_v1"
 RULE_VERSION = "voc_rule_v1"
 LABEL_CACHE: dict[str, dict[str, Any]] = {}
@@ -64,6 +70,21 @@ DEFAULT_SOURCE_TABLE_NAME = "dwd_rpa_voc_business"
 DEFAULT_RESULT_TABLE_NAME = "voc_tag_result"
 DEFAULT_RESULT_DB_CONNECTION = "target"
 DEFAULT_RESULT_WRITE_MODE = "mysql"
+DEFAULT_SCHEDULE_MODE = "daily"
+DEFAULT_SCHEDULE_DAILY_TIME = "02:00"
+DEFAULT_SCHEDULE_INTERVAL_MINUTES = "30"
+SCHEDULE_CONFIG_KEYS = {
+    "schedule_enabled",
+    "schedule_mode",
+    "schedule_daily_time",
+    "schedule_interval_minutes",
+}
+PROFILE_IDS_BY_CONFIG_NAME = {
+    "voc_tagger_config.json": "business",
+    "voc_business_tagger_config.json": "business",
+    "voc_original_statement_tagger_config.json": "original_statement",
+}
+MUTEX_ALREADY_EXISTS = 183
 DEFAULT_SYSTEM_PROMPT = (
     "\u4f60\u662fVOC\u56db\u7ea7\u6807\u7b7e\u5206\u7c7b\u5668\u3002"
     "\u8bf7\u6839\u636e\u7528\u6237\u8bc4\u8bba\uff0c\u4ece\u7ed9\u5b9a\u5019\u9009\u6807\u7b7e\u4e2d\u53ea\u9009\u62e9\u4e00\u4e2a\u6700\u5408\u9002\u7684\u56db\u7ea7\u7c7b\u76ee\uff0c\u4e0d\u80fd\u521b\u9020\u65b0\u6807\u7b7e\u3002"
@@ -84,6 +105,208 @@ DEFAULT_DECISION_RULES = "\n".join(
         "\u53ea\u8f93\u51fa\u5408\u6cd5JSON\uff0c\u4e0d\u8981\u89e3\u91ca\u3002",
     ]
 )
+
+
+def resolve_profile_id(
+    profile_id: str = "",
+    config_path: Path = CONFIG_PATH,
+) -> str:
+    if profile_id.strip():
+        return profile_id.strip().lower()
+    return PROFILE_IDS_BY_CONFIG_NAME.get(
+        Path(config_path).name.lower(),
+        DEFAULT_PROFILE_ID,
+    )
+
+
+def profile_mutex_name(profile_id: str = DEFAULT_PROFILE_ID) -> str:
+    stable_profile_id = resolve_profile_id(profile_id)
+    identity = f"{PACKAGE_DIR.resolve()}|{stable_profile_id}".lower().encode("utf-8")
+    return "Local\\VOC_AI_Tagger_" + hashlib.md5(identity).hexdigest()
+
+
+def acquire_profile_mutex(profile_id: str = DEFAULT_PROFILE_ID):
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateMutexW(None, False, profile_mutex_name(profile_id))
+    if not handle:
+        raise ctypes.WinError()
+    if ctypes.get_last_error() == MUTEX_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
+def release_profile_mutex(handle) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.ReleaseMutex(handle)
+    kernel32.CloseHandle(handle)
+
+
+def normalized_schedule(values: dict[str, str]) -> dict[str, str]:
+    mode = values.get("schedule_mode", DEFAULT_SCHEDULE_MODE).strip().lower()
+    if mode == "daily":
+        daily_time = values.get(
+            "schedule_daily_time",
+            DEFAULT_SCHEDULE_DAILY_TIME,
+        ).strip()
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", daily_time):
+            raise ValueError("每天执行时间必须使用 HH:mm 格式，例如 02:00。")
+        try:
+            parsed_time = datetime.strptime(daily_time, "%H:%M")
+        except ValueError as exc:
+            raise ValueError("每天执行时间必须使用 HH:mm 格式，例如 02:00。") from exc
+        return {
+            "mode": "Daily",
+            "daily_time": parsed_time.strftime("%H:%M"),
+        }
+    if mode == "minutes":
+        interval_text = values.get(
+            "schedule_interval_minutes",
+            DEFAULT_SCHEDULE_INTERVAL_MINUTES,
+        ).strip()
+        try:
+            interval_minutes = int(interval_text)
+        except ValueError as exc:
+            raise ValueError("间隔分钟必须是整数，且不能小于 5。") from exc
+        if interval_minutes < 5:
+            raise ValueError("间隔分钟不能小于 5。")
+        return {
+            "mode": "Minutes",
+            "interval_minutes": str(interval_minutes),
+        }
+    raise ValueError("定时方式只能选择每天固定时间或每隔 N 分钟。")
+
+
+def build_scheduled_task_command(
+    operation: str,
+    task_name: str,
+    config_path: Path,
+    profile_name: str,
+    values: dict[str, str] | None = None,
+    profile_id: str = DEFAULT_PROFILE_ID,
+) -> list[str]:
+    normalized_operation = operation.strip().capitalize()
+    if normalized_operation not in {"Install", "Remove", "Query"}:
+        raise ValueError(f"不支持的定时任务操作：{operation}")
+    if not task_name.strip():
+        raise ValueError("定时任务名称不能为空。")
+
+    command = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(SCHEDULE_TASK_SCRIPT),
+        "-Operation",
+        normalized_operation,
+        "-TaskName",
+        task_name.strip(),
+    ]
+    if normalized_operation == "Query":
+        command.extend(
+            [
+                "-ConfigPath",
+                str(Path(config_path).resolve()),
+                "-ProfileName",
+                profile_name.strip() or "默认配置",
+                "-ProfileId",
+                resolve_profile_id(profile_id, config_path),
+            ]
+        )
+    if normalized_operation == "Install":
+        schedule = normalized_schedule(values or {})
+        command.extend(
+            [
+                "-ConfigPath",
+                str(Path(config_path).resolve()),
+                "-ProfileName",
+                profile_name.strip() or "默认配置",
+                "-ProfileId",
+                resolve_profile_id(profile_id, config_path),
+                "-Mode",
+                schedule["mode"],
+            ]
+        )
+        if schedule["mode"] == "Daily":
+            command.extend(["-DailyTime", schedule["daily_time"]])
+        else:
+            command.extend(["-EveryMinutes", schedule["interval_minutes"]])
+    return command
+
+
+def invoke_scheduled_task(
+    operation: str,
+    task_name: str,
+    config_path: Path,
+    profile_name: str,
+    values: dict[str, str] | None = None,
+    runner=None,
+    profile_id: str = DEFAULT_PROFILE_ID,
+) -> str:
+    command = build_scheduled_task_command(
+        operation,
+        task_name,
+        config_path,
+        profile_name,
+        values,
+        profile_id,
+    )
+    run_command = runner or subprocess.run
+    run_options = {
+        "cwd": PACKAGE_DIR,
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "check": False,
+    }
+    if os.name == "nt":
+        run_options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    completed = run_command(command, **run_options)
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    if completed.returncode != 0:
+        detail = stderr or stdout or f"PowerShell 返回状态 {completed.returncode}"
+        raise RuntimeError("Windows 定时任务操作失败：" + detail)
+    return stdout
+
+
+def parse_scheduled_task_status(output: str) -> tuple[bool, str]:
+    marker = next(
+        (
+            line.strip()
+            for line in reversed(output.splitlines())
+            if line.strip().startswith("VOC_TASK_STATUS:")
+        ),
+        "",
+    )
+    if marker in {"VOC_TASK_STATUS:NOT_FOUND", "VOC_TASK_STATUS:REMOVED"}:
+        return False, "未启用"
+    if marker == "VOC_TASK_STATUS:DISABLED":
+        return False, "已停用"
+    if marker.startswith("VOC_TASK_STATUS:LEGACY"):
+        return False, "旧任务待升级"
+    if marker.startswith("VOC_TASK_STATUS:INSTALLED"):
+        state = marker.partition("VOC_TASK_STATUS:INSTALLED:")[2]
+        if state == "Disabled":
+            return False, "已停用"
+        state_text = {
+            "Ready": "已启用",
+            "Running": "正在运行",
+            "Queued": "等待运行",
+        }.get(state, "已启用")
+        return True, state_text
+    raise RuntimeError("无法识别 Windows 定时任务返回状态。")
 
 
 @dataclass
@@ -1631,20 +1854,31 @@ class VocTaggerApp:
         config_path: Path = CONFIG_PATH,
         profile_name: str = "",
         profile_defaults: dict[str, str] | None = None,
+        schedule_task_name: str = DEFAULT_SCHEDULE_TASK_NAME,
+        profile_id: str = DEFAULT_PROFILE_ID,
     ):
         self.root = root
         self.config_path = Path(config_path).resolve()
+        self.profile_name = profile_name.strip() or "默认配置"
+        self.schedule_task_name = schedule_task_name.strip()
+        self.profile_id = resolve_profile_id(profile_id, self.config_path)
         self.profile_defaults = profile_defaults or {}
-        title_suffix = profile_name.strip() or "默认配置"
-        self.root.title(f"VOC AI 打标控制器 - {title_suffix}")
-        self.root.geometry("980x720")
+        self.root.title(f"VOC AI 打标控制器 - {self.profile_name}")
+        self.root.geometry("980x640")
         self.root.minsize(860, 560)
         self.vars: dict[str, tk.StringVar] = {}
         self.text_widgets: dict[str, tk.Text] = {}
+        self.encrypted_secret_fallbacks: dict[str, str] = {}
+        self.unresolved_secret_keys: set[str] = set()
         self.running = False
         self.stop_requested = False
+        self.profile_mutex_handle = None
+        self.schedule_busy = False
+        self.ui_events: queue.Queue = queue.Queue()
         self._build_ui()
         self._load_config()
+        self.root.after(50, self._drain_ui_events)
+        self.root.after(100, self.refresh_schedule_status)
 
     def _add_entry(self, parent, row: int, label: str, key: str, default: str = "", show: str | None = None):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=3)
@@ -1761,8 +1995,66 @@ class VocTaggerApp:
         ttk.Checkbutton(run_frame, text="启用 AI 兜底", variable=self.vars["use_ai"], onvalue="1", offvalue="0").grid(row=0, column=2, sticky="w", padx=12)
         ttk.Checkbutton(run_frame, text="Dry-run 不写库", variable=self.vars["dry_run"], onvalue="1", offvalue="0").grid(row=1, column=2, sticky="w", padx=12)
 
+        schedule_frame = ttk.LabelFrame(frame, text="定时设置", padding=8)
+        schedule_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        schedule_frame.columnconfigure(1, weight=1)
+        ttk.Label(schedule_frame, text="定时方式").grid(row=0, column=0, sticky="w", padx=6, pady=3)
+        self.vars["schedule_mode"] = tk.StringVar(value=DEFAULT_SCHEDULE_MODE)
+        mode_frame = ttk.Frame(schedule_frame)
+        mode_frame.grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        ttk.Radiobutton(
+            mode_frame,
+            text="每天固定时间",
+            variable=self.vars["schedule_mode"],
+            value="daily",
+        ).pack(side="left", padx=(0, 14))
+        ttk.Radiobutton(
+            mode_frame,
+            text="每隔 N 分钟",
+            variable=self.vars["schedule_mode"],
+            value="minutes",
+        ).pack(side="left")
+        self._add_entry(
+            schedule_frame,
+            1,
+            "每天时间（HH:mm）",
+            "schedule_daily_time",
+            DEFAULT_SCHEDULE_DAILY_TIME,
+        )
+        self._add_entry(
+            schedule_frame,
+            2,
+            "间隔分钟（至少 5）",
+            "schedule_interval_minutes",
+            DEFAULT_SCHEDULE_INTERVAL_MINUTES,
+        )
+        self.vars["schedule_enabled"] = tk.StringVar(value="0")
+        self.schedule_status_var = tk.StringVar(value="正在检查...")
+        ttk.Label(schedule_frame, text="当前状态").grid(row=0, column=2, sticky="e", padx=(18, 6), pady=3)
+        ttk.Label(schedule_frame, textvariable=self.schedule_status_var).grid(row=0, column=3, sticky="w", padx=6, pady=3)
+        schedule_buttons = ttk.Frame(schedule_frame)
+        schedule_buttons.grid(row=1, column=2, columnspan=2, rowspan=2, sticky="w", padx=(18, 6), pady=3)
+        self.apply_schedule_btn = ttk.Button(
+            schedule_buttons,
+            text="应用 / 更新定时",
+            command=self.apply_schedule,
+        )
+        self.apply_schedule_btn.pack(side="left", padx=(0, 6))
+        self.disable_schedule_btn = ttk.Button(
+            schedule_buttons,
+            text="停用定时",
+            command=self.disable_schedule,
+        )
+        self.disable_schedule_btn.pack(side="left", padx=6)
+        self.refresh_schedule_btn = ttk.Button(
+            schedule_buttons,
+            text="刷新状态",
+            command=lambda: self.refresh_schedule_status(show_errors=True),
+        )
+        self.refresh_schedule_btn.pack(side="left", padx=6)
+
         prompt_frame = ttk.LabelFrame(frame, text="AI 提示词设置", padding=8)
-        prompt_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+        prompt_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
         prompt_frame.columnconfigure(0, weight=1)
         prompt_frame.columnconfigure(1, weight=1)
         ttk.Label(prompt_frame, text="系统提示词").grid(row=0, column=0, sticky="w", padx=4)
@@ -1777,7 +2069,7 @@ class VocTaggerApp:
         self.text_widgets["decision_rules"] = decision_rules
 
         log_frame = ttk.LabelFrame(frame, text="运行日志", padding=8)
-        log_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+        log_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
         log_frame.columnconfigure(0, weight=1)
         self.log_box = scrolledtext.ScrolledText(log_frame, height=12)
         self.log_box.grid(row=0, column=0, sticky="nsew")
@@ -1820,6 +2112,9 @@ class VocTaggerApp:
                     try:
                         value = decrypt_secret(value)
                     except Exception:
+                        if value:
+                            self.encrypted_secret_fallbacks[key] = value
+                            self.unresolved_secret_keys.add(key)
                         value = ""
                         decrypt_failed = True
                 else:
@@ -1832,18 +2127,284 @@ class VocTaggerApp:
         if decrypt_failed:
             self.log("部分密码或 API Key 无法由当前 Windows 用户解密，请重新填写并保存。")
 
-    def save_config(self):
+    def save_config(
+        self,
+        show_confirmation: bool = True,
+        overrides: dict[str, str] | None = None,
+        preserve_schedule_metadata: bool = False,
+    ) -> dict[str, str]:
+        saved_schedule_metadata = {}
+        if preserve_schedule_metadata and self.config_path.exists():
+            try:
+                saved_values = json.loads(self.config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                saved_values = {}
+            saved_schedule_metadata = {
+                key: saved_values[key]
+                for key in SCHEDULE_CONFIG_KEYS
+                if key in saved_values
+            }
         values = self.values()
+        if overrides:
+            values.update(overrides)
+        encrypted_fallbacks = getattr(self, "encrypted_secret_fallbacks", {})
+        unresolved_keys = getattr(self, "unresolved_secret_keys", set())
         for key in SENSITIVE_CONFIG_KEYS:
-            values[key] = encrypt_secret(values.get(key, ""))
+            plain_value = values.get(key, "")
+            if plain_value:
+                values[key] = encrypt_secret(plain_value)
+                encrypted_fallbacks[key] = values[key]
+                unresolved_keys.discard(key)
+            elif key in unresolved_keys and encrypted_fallbacks.get(key):
+                values[key] = encrypted_fallbacks[key]
+            else:
+                values[key] = encrypt_secret(plain_value)
+        if preserve_schedule_metadata:
+            for key in SCHEDULE_CONFIG_KEYS:
+                if key in saved_schedule_metadata:
+                    values[key] = saved_schedule_metadata[key]
+                else:
+                    values.pop(key, None)
         self.config_path.write_text(
             json.dumps(values, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        messagebox.showinfo(
-            "已保存",
-            f"配置已保存到：{self.config_path}\n数据库密码和 API Key 已使用当前 Windows 用户加密。",
+        if show_confirmation:
+            messagebox.showinfo(
+                "已保存",
+                f"配置已保存到：{self.config_path}\n"
+                "数据库密码和 API Key 已使用当前 Windows 用户加密。\n"
+                "定时任务只有点击“应用 / 更新定时”后才会改变。",
+            )
+        return values
+
+    def _drain_ui_events(self):
+        try:
+            while True:
+                callback, args = self.ui_events.get_nowait()
+                callback(*args)
+        except queue.Empty:
+            pass
+        try:
+            self.root.after(50, self._drain_ui_events)
+        except tk.TclError:
+            pass
+
+    def _post_ui(self, callback, *args):
+        self.ui_events.put((callback, args))
+
+    def _set_schedule_busy(self, busy: bool, status_text: str | None = None):
+        self.schedule_busy = busy
+        button_state = "disabled" if busy else "normal"
+        for button_name in (
+            "apply_schedule_btn",
+            "disable_schedule_btn",
+            "refresh_schedule_btn",
+        ):
+            button = getattr(self, button_name, None)
+            if button is not None:
+                button.configure(state=button_state)
+        if status_text is not None:
+            self.schedule_status_var.set(status_text)
+
+    def _run_schedule_in_background(
+        self,
+        operation: str,
+        values: dict[str, str] | None,
+        status_text: str,
+        success_callback,
+        failure_label: str,
+        show_errors: bool = True,
+    ):
+        self._set_schedule_busy(True, status_text)
+
+        def worker():
+            try:
+                output = invoke_scheduled_task(
+                    operation,
+                    self.schedule_task_name,
+                    self.config_path,
+                    self.profile_name,
+                    values,
+                    profile_id=self.profile_id,
+                )
+            except Exception as exc:
+                self._post_ui(
+                    self._finish_schedule_error,
+                    failure_label,
+                    str(exc),
+                    show_errors,
+                )
+                return
+            self._post_ui(success_callback, output)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_schedule_error(
+        self,
+        action_label: str,
+        error_message: str,
+        show_errors: bool,
+    ):
+        self._set_schedule_busy(False, f"{action_label}失败")
+        self.log(f"定时任务{action_label}失败：{error_message}")
+        if show_errors:
+            messagebox.showerror(f"定时任务{action_label}失败", error_message)
+
+    def refresh_schedule_status(self, show_errors: bool = False):
+        if not self.schedule_task_name:
+            self.schedule_status_var.set("此入口未配置定时任务")
+            return
+        if self.schedule_busy:
+            if show_errors:
+                messagebox.showwarning("请稍候", "定时任务操作正在进行中。")
+            return
+        self._run_schedule_in_background(
+            "Query",
+            None,
+            "正在检查...",
+            self._finish_schedule_query,
+            "状态检查",
+            show_errors,
         )
+
+    def _finish_schedule_query(self, output: str):
+        try:
+            enabled, status_text = parse_scheduled_task_status(output)
+        except Exception as exc:
+            self._finish_schedule_error("状态检查", str(exc), False)
+            return
+        self.vars["schedule_enabled"].set("1" if enabled else "0")
+        self._set_schedule_busy(
+            False,
+            f"{status_text}（{self.schedule_task_name}）",
+        )
+
+    def apply_schedule(self):
+        if self.schedule_busy:
+            messagebox.showwarning("请稍候", "定时任务操作正在进行中。")
+            return
+        values = self.values()
+        required_secret_keys = {"source_db_password", "target_db_password"}
+        if values.get("use_ai") == "1":
+            required_secret_keys.add("api_key")
+        unresolved = [
+            key
+            for key in required_secret_keys
+            if key in self.unresolved_secret_keys and not values.get(key, "").strip()
+        ]
+        if unresolved:
+            labels = {
+                "source_db_password": "来源数据库密码",
+                "target_db_password": "目标数据库密码",
+                "api_key": "API Key",
+            }
+            messagebox.showwarning(
+                "请重新填写密钥",
+                "以下内容无法由当前 Windows 用户解密：\n"
+                + "\n".join(f"- {labels[key]}" for key in unresolved)
+                + "\n请重新填写后再应用定时任务。原密文尚未被覆盖。",
+            )
+            return
+        try:
+            schedule = normalized_schedule(values)
+        except ValueError as exc:
+            messagebox.showwarning("定时配置错误", str(exc))
+            return
+
+        schedule_metadata = {
+            "schedule_mode": values.get("schedule_mode", DEFAULT_SCHEDULE_MODE).strip().lower(),
+            "schedule_daily_time": values.get(
+                "schedule_daily_time",
+                DEFAULT_SCHEDULE_DAILY_TIME,
+            ).strip(),
+            "schedule_interval_minutes": values.get(
+                "schedule_interval_minutes",
+                DEFAULT_SCHEDULE_INTERVAL_MINUTES,
+            ).strip(),
+        }
+        if schedule["mode"] == "Daily":
+            schedule_metadata["schedule_daily_time"] = schedule["daily_time"]
+        else:
+            schedule_metadata["schedule_interval_minutes"] = schedule["interval_minutes"]
+
+        self.save_config(
+            show_confirmation=False,
+            preserve_schedule_metadata=True,
+        )
+        schedule_text = (
+            f"每天 {schedule['daily_time']}"
+            if schedule["mode"] == "Daily"
+            else f"每隔 {schedule['interval_minutes']} 分钟"
+        )
+        self._run_schedule_in_background(
+            "Install",
+            values,
+            "正在应用...",
+            lambda output: self._finish_apply_schedule(
+                output,
+                schedule_text,
+                schedule_metadata,
+            ),
+            "应用",
+        )
+
+    def _finish_apply_schedule(
+        self,
+        output: str,
+        schedule_text: str,
+        schedule_metadata: dict[str, str],
+    ):
+        try:
+            enabled, status_text = parse_scheduled_task_status(output)
+            if not enabled:
+                raise RuntimeError("Windows 未返回已启用状态。")
+        except Exception as exc:
+            self._finish_schedule_error("应用", str(exc), True)
+            return
+        self.vars["schedule_enabled"].set("1")
+        self.save_config(
+            show_confirmation=False,
+            overrides={**schedule_metadata, "schedule_enabled": "1"},
+        )
+        self._set_schedule_busy(False, f"{status_text}（{self.schedule_task_name}）")
+        self.log(f"定时任务已应用：{self.schedule_task_name}，{schedule_text}")
+        messagebox.showinfo(
+            "定时任务已启用",
+            f"{self.profile_name}：{schedule_text}\n"
+            "Windows 登录时也会自动补跑一次。",
+        )
+
+    def disable_schedule(self):
+        if self.schedule_busy:
+            messagebox.showwarning("请稍候", "定时任务操作正在进行中。")
+            return
+        if not messagebox.askyesno(
+            "确认停用",
+            f"确认停用“{self.profile_name}”的定时任务吗？\n"
+            "当前正在执行的批次会继续完成，后续触发将被停用。",
+        ):
+            return
+        self._run_schedule_in_background(
+            "Remove",
+            None,
+            "正在停用...",
+            self._finish_disable_schedule,
+            "停用",
+        )
+
+    def _finish_disable_schedule(self, output: str):
+        try:
+            _enabled, status_text = parse_scheduled_task_status(output)
+        except Exception as exc:
+            self._finish_schedule_error("停用", str(exc), True)
+            return
+        self.vars["schedule_enabled"].set("0")
+        if self.config_path.exists():
+            self.save_config(show_confirmation=False, overrides={"schedule_enabled": "0"})
+        self._set_schedule_busy(False, f"{status_text}（{self.schedule_task_name}）")
+        self.log(f"定时任务已停用：{self.schedule_task_name}")
+        messagebox.showinfo("已停用", f"已停用“{self.profile_name}”的定时任务。")
 
     def test_db(self):
         source_conn = None
@@ -1962,12 +2523,32 @@ class VocTaggerApp:
             ):
                 return
 
+        try:
+            self.profile_mutex_handle = acquire_profile_mutex(self.profile_id)
+        except Exception as exc:
+            messagebox.showerror("无法启动", f"无法创建运行锁：{exc}")
+            return
+        if self.profile_mutex_handle is None:
+            messagebox.showwarning(
+                "当前打标器正在运行",
+                "同一打标器已有手工或定时批次在运行，请等待该批次结束后再试。",
+            )
+            return
+
         self.running = True
         self.stop_requested = False
         self.start_btn.configure(state="disabled")
         self.pause_btn.configure(state="normal")
         thread = threading.Thread(target=self._run_thread, daemon=True)
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            release_profile_mutex(self.profile_mutex_handle)
+            self.profile_mutex_handle = None
+            self.running = False
+            self.start_btn.configure(state="normal")
+            self.pause_btn.configure(state="disabled")
+            raise
 
     def pause(self):
         if self.running:
@@ -1983,6 +2564,9 @@ class VocTaggerApp:
             self.log(str(exc))
             self.log(traceback.format_exc())
         finally:
+            if self.profile_mutex_handle is not None:
+                release_profile_mutex(self.profile_mutex_handle)
+                self.profile_mutex_handle = None
             self.running = False
             self.start_btn.configure(state="normal")
             self.pause_btn.configure(state="disabled")
@@ -2000,6 +2584,16 @@ def parse_runtime_args(argv=None):
         default="",
         help="显示在窗口标题中的配置名称",
     )
+    parser.add_argument(
+        "--profile-id",
+        default="",
+        help="用于区分并发锁的稳定打标器标识",
+    )
+    parser.add_argument(
+        "--schedule-task-name",
+        default=DEFAULT_SCHEDULE_TASK_NAME,
+        help="当前打标器对应的 Windows 定时任务名称",
+    )
     parser.add_argument("--default-source-table", default=DEFAULT_SOURCE_TABLE_NAME)
     parser.add_argument("--default-result-table", default=DEFAULT_RESULT_TABLE_NAME)
     parser.add_argument(
@@ -2014,7 +2608,9 @@ def parse_runtime_args(argv=None):
     )
     parser.add_argument("--default-api-base-url", default="https://api.openai.com/v1")
     parser.add_argument("--default-model", default="gpt-4.1-mini")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.profile_id = resolve_profile_id(args.profile_id, args.config)
+    return args
 
 
 def main(argv=None):
@@ -2033,6 +2629,8 @@ def main(argv=None):
         config_path=args.config,
         profile_name=args.profile_name,
         profile_defaults=profile_defaults,
+        schedule_task_name=args.schedule_task_name,
+        profile_id=args.profile_id,
     )
     app.log(f"当前配置：{args.profile_name or app.config_path.name}")
     app.log("小范围测试建议：先勾选 Dry-run，本批数量设为 5。确认结果后再取消 Dry-run 写库。")

@@ -22,8 +22,8 @@
 ├─ start_voc_original_statement_tagger.bat # 原始语句打标器
 ├─ start_desktop.bat                       # 两个入口共用的便携桌面启动脚本
 ├─ start_voc_ai_tagger.bat                 # 兼容旧桌面入口
-├─ run_once.bat                            # 单配置无界面批处理
-├─ start_voc_scheduler.bat                 # 兼容定时任务安装入口
+├─ run_once.bat                            # 可指定配置的无界面批处理
+├─ start_voc_scheduler.bat                 # 旧单任务兼容入口
 ├─ scripts/
 │  ├─ voc_ai_tag_controller.py             # VOC 打标主程序
 │  ├─ voc_scheduler_server.py              # 简易本地调度后台
@@ -87,13 +87,14 @@ start_voc_original_statement_tagger.bat   # rpa.dwd_rpa_voc_original_statement -
 
 ### Windows 定时任务
 
-双击：
+定时设置已经放进两个打标器窗口。打开对应窗口后，在“定时设置”中选择“每天固定时间”或“每隔 N 分钟”，然后点击“应用 / 更新定时”。两个任务分别读取各自的完整配置：
 
 ```text
-start_voc_scheduler.bat
+原业务宽表：VOC AI Tagger
+原始语句：VOC AI Tagger - Original Statement
 ```
 
-该入口用于安装或更新 Windows 定时任务。当前双配置只作用于桌面版；`run_once.bat` 和定时任务仍使用 `scripts/voc_tagger_config.json` 单配置，默认执行原业务宽表链路。
+业务任务沿用旧任务名 `VOC AI Tagger`。已有旧宽表任务不会因代码更新自动改变，业务窗口会显示“旧任务待升级”；点击“应用 / 更新定时”后，会原位更新旧任务，不会额外创建一个重复的宽表任务。`start_voc_scheduler.bat`、`install_schedule.bat` 和 `remove_schedule.bat` 只保留给旧单任务流程兼容使用，新配置不需要再打开这些入口。
 
 ## 依赖
 
@@ -134,9 +135,14 @@ start_voc_original_statement_tagger.bat
 标签版本
 register_month
 AI API Key / Base URL / 模型名
+定时方式和执行时间
 ```
 
 5. 先勾选 Dry-run，本批数量设置为 5，确认结果后再取消 Dry-run 写库。
+
+6. 需要自动运行时，在当前打标器窗口点击“应用 / 更新定时”；需要停止自动运行时点击“停用定时”。停用其中一个任务不会影响另一个。
+
+保存配置或更新代码不会创建 Windows 定时任务。只在实际承担定时打标的电脑上点击“应用 / 更新定时”。
 
 ## 配置文件安全
 
@@ -158,7 +164,7 @@ voc_scheduler_config.json
 
 首次安装按 `README_GITHUB_DEPLOY.md` 克隆仓库并运行 `setup_new_pc.bat`。已有安装在本次改动合并到 `master` 后双击 `update_code.bat`，即可通过 `git pull --ff-only` 拉取最新代码。
 
-Git 只同步共享代码、启动入口、测试和文档，不同步上述本地配置文件。更新后分别运行两个桌面入口，在该电脑重新填写数据库密码和 API Key 并保存；该电脑还需要能访问来源库、标签知识库和 AI 接口。
+Git 只同步共享代码、启动入口、测试和文档，不同步上述本地配置文件或 Windows 定时任务。更新后分别运行两个桌面入口，在该电脑重新填写数据库密码和 API Key 并保存，再按需要应用各自的定时设置；该电脑还需要能访问来源库、标签知识库和 AI 接口。
 
 ## 注意事项
 

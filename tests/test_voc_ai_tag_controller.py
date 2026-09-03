@@ -83,6 +83,8 @@ class RuntimeArgumentTests(unittest.TestCase):
 
         self.assertEqual(controller.CONFIG_PATH, args.config)
         self.assertEqual("", args.profile_name)
+        self.assertEqual(controller.DEFAULT_PROFILE_ID, args.profile_id)
+        self.assertEqual(controller.DEFAULT_SCHEDULE_TASK_NAME, args.schedule_task_name)
         self.assertEqual(controller.DEFAULT_SOURCE_TABLE_NAME, args.default_source_table)
         self.assertEqual(controller.DEFAULT_RESULT_TABLE_NAME, args.default_result_table)
         self.assertEqual("target", args.default_result_db_connection)
@@ -99,6 +101,10 @@ class RuntimeArgumentTests(unittest.TestCase):
                 str(config_path),
                 "--profile-name",
                 "PHQ2-客诉VOC",
+                "--profile-id",
+                "phq2",
+                "--schedule-task-name",
+                "VOC AI Tagger - PHQ2",
                 "--default-source-table",
                 "rpa.dwd_rpa_voc_original_statement",
                 "--default-result-table",
@@ -116,6 +122,8 @@ class RuntimeArgumentTests(unittest.TestCase):
 
         self.assertEqual(config_path, args.config)
         self.assertEqual("PHQ2-客诉VOC", args.profile_name)
+        self.assertEqual("phq2", args.profile_id)
+        self.assertEqual("VOC AI Tagger - PHQ2", args.schedule_task_name)
         self.assertEqual(
             "rpa.dwd_rpa_voc_original_statement",
             args.default_source_table,
@@ -147,6 +155,10 @@ class RuntimeArgumentTests(unittest.TestCase):
                     str(config_path),
                     "--profile-name",
                     "原始语句",
+                    "--profile-id",
+                    "original_statement",
+                    "--schedule-task-name",
+                    "VOC AI Tagger - Original Statement",
                     "--default-source-table",
                     "rpa.dwd_rpa_voc_original_statement",
                     "--default-result-table",
@@ -166,6 +178,7 @@ class RuntimeArgumentTests(unittest.TestCase):
             root,
             config_path=config_path,
             profile_name="原始语句",
+            profile_id="original_statement",
             profile_defaults={
                 "source_table_name": "rpa.dwd_rpa_voc_original_statement",
                 "result_table_name": "rpa.ods_rpa_voc_original_statement_tag_result",
@@ -174,6 +187,7 @@ class RuntimeArgumentTests(unittest.TestCase):
                 "api_base_url": "http://ai.xmpaohong.com:8080/v1",
                 "model_name": "gpt-5.6-sol",
             },
+            schedule_task_name="VOC AI Tagger - Original Statement",
         )
         root.mainloop.assert_called_once_with()
 
