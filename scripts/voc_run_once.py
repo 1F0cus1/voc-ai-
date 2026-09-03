@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import ctypes
-from ctypes import wintypes
+import argparse
 import json
 import os
+import re
 import sys
 import traceback
 from datetime import datetime, timedelta
@@ -18,17 +18,17 @@ APP_DIR = Path(__file__).resolve().parent
 PACKAGE_DIR = APP_DIR.parent
 CONFIG_PATH = APP_DIR / "voc_tagger_config.json"
 LOG_DIR = PACKAGE_DIR / "logs"
-MUTEX_ALREADY_EXISTS = 183
-
-
 class RunLogger:
-    def __init__(self) -> None:
+    def __init__(self, config_path: Path = CONFIG_PATH, profile_name: str = "") -> None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        self.path = LOG_DIR / f"voc_run_{datetime.now():%Y%m%d}.log"
+        config_stem = Path(config_path).stem.lower()
+        config_stem = re.sub(r"[^a-z0-9]+", "_", config_stem).strip("_")
+        self.profile_name = profile_name.strip() or config_stem or "default"
+        self.path = LOG_DIR / f"voc_run_{config_stem or 'default'}_{datetime.now():%Y%m%d}.log"
         self.failed_rows = 0
 
     def __call__(self, message: str) -> None:
-        line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}"
+        line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{self.profile_name}] {message}"
         print(line, flush=True)
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
@@ -48,14 +48,38 @@ def cleanup_old_logs(days: int = 30) -> None:
             pass
 
 
-def load_config() -> dict[str, str]:
-    if not CONFIG_PATH.exists():
+def parse_runtime_args(argv=None):
+    parser = argparse.ArgumentParser(description="运行一次 VOC AI 打标批次")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=CONFIG_PATH,
+        help="本批次读取的配置文件",
+    )
+    parser.add_argument(
+        "--profile-name",
+        default="",
+        help="日志中显示的打标器名称",
+    )
+    parser.add_argument(
+        "--profile-id",
+        default="",
+        help="用于区分并发锁的稳定打标器标识",
+    )
+    args = parser.parse_args(argv)
+    args.profile_id = controller.resolve_profile_id(args.profile_id, args.config)
+    return args
+
+
+def load_config(config_path: Path = CONFIG_PATH) -> dict[str, str]:
+    config_path = Path(config_path).resolve()
+    if not config_path.exists():
         raise RuntimeError(
-            "未找到配置文件。请先双击 start_desktop.bat，填写配置并点击保存配置。"
+            f"未找到配置文件：{config_path}。请先打开对应打标器，填写并保存配置。"
         )
 
     try:
-        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"配置文件读取失败：{exc}") from exc
 
@@ -120,43 +144,30 @@ def load_config() -> dict[str, str]:
     return values
 
 
-def acquire_mutex():
-    identity = str(PACKAGE_DIR).lower().encode("utf-8")
-    name = "Local\\VOC_AI_Tagger_" + __import__("hashlib").md5(identity).hexdigest()
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-    kernel32.CreateMutexW.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    handle = kernel32.CreateMutexW(None, False, name)
-    if not handle:
-        raise ctypes.WinError()
-    if ctypes.get_last_error() == MUTEX_ALREADY_EXISTS:
-        kernel32.CloseHandle(handle)
-        return None
-    return handle
+def mutex_name(profile_id: str = controller.DEFAULT_PROFILE_ID) -> str:
+    return controller.profile_mutex_name(profile_id)
+
+
+def acquire_mutex(profile_id: str = controller.DEFAULT_PROFILE_ID):
+    return controller.acquire_profile_mutex(profile_id)
 
 
 def release_mutex(handle) -> None:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
-    kernel32.ReleaseMutex.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.ReleaseMutex(handle)
-    kernel32.CloseHandle(handle)
+    controller.release_profile_mutex(handle)
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    args = parse_runtime_args(argv)
+    config_path = args.config.resolve()
     cleanup_old_logs()
-    log = RunLogger()
-    mutex = acquire_mutex()
+    log = RunLogger(config_path, args.profile_name)
+    mutex = acquire_mutex(args.profile_id)
     if mutex is None:
-        log("已有一个 VOC 打标任务正在运行，本次定时触发已跳过。")
+        log("当前打标器已有一个批次正在运行，本次定时触发已跳过。")
         return 0
 
     try:
-        values = load_config()
+        values = load_config(config_path)
         month = values.get("register_month", "").strip()
         log("定时批处理开始。登记月份：" + (month or "全部月份"))
         if values.get("dry_run") == "1":

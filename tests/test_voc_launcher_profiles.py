@@ -15,6 +15,8 @@ class VocLauncherProfileTests(unittest.TestCase):
         "start_voc_business_tagger.bat": {
             "--config": r"%~dp0scripts\voc_business_tagger_config.json",
             "--profile-name": "原业务宽表",
+            "--profile-id": "business",
+            "--schedule-task-name": "VOC AI Tagger",
             "--default-source-table": "dwd_rpa_voc_business",
             "--default-result-table": "voc_tag_result",
             "--default-result-db-connection": "target",
@@ -25,6 +27,8 @@ class VocLauncherProfileTests(unittest.TestCase):
         "start_voc_original_statement_tagger.bat": {
             "--config": r"%~dp0scripts\voc_original_statement_tagger_config.json",
             "--profile-name": "原始语句",
+            "--profile-id": "original_statement",
+            "--schedule-task-name": "VOC AI Tagger - Original Statement",
             "--default-source-table": "rpa.dwd_rpa_voc_original_statement",
             "--default-result-table": "rpa.ods_rpa_voc_original_statement_tag_result",
             "--default-result-db-connection": "source",
@@ -51,6 +55,18 @@ class VocLauncherProfileTests(unittest.TestCase):
             for arguments in self.PROFILE_LAUNCHERS.values()
         }
         self.assertEqual(len(self.PROFILE_LAUNCHERS), len(configs))
+
+    def test_profile_launchers_use_distinct_compatible_schedule_task_names(self):
+        task_names = {
+            arguments["--schedule-task-name"]
+            for arguments in self.PROFILE_LAUNCHERS.values()
+        }
+
+        self.assertEqual(len(self.PROFILE_LAUNCHERS), len(task_names))
+        self.assertEqual(
+            "VOC AI Tagger",
+            self.PROFILE_LAUNCHERS["start_voc_business_tagger.bat"]["--schedule-task-name"],
+        )
 
     def test_profile_launchers_are_parsed_by_windows_cmd(self):
         if os.name != "nt":
@@ -126,6 +142,14 @@ class VocLauncherProfileTests(unittest.TestCase):
             content,
         )
         self.assertNotIn(r"C:\Users\Admin\Documents\my_app", content)
+
+    def test_run_once_launcher_forwards_profile_arguments(self):
+        content = (PROJECT_ROOT / "run_once.bat").read_text(encoding="utf-8")
+
+        self.assertIn(
+            '"%PYTHON_EXE%" "%~dp0scripts\\voc_run_once.py" %*',
+            content,
+        )
 
 
 if __name__ == "__main__":
